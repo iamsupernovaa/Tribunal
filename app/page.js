@@ -1,92 +1,147 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
+import JSZip from 'jszip';
 
 const DEFAULTS = {
-  openaiModel: 'gpt-5.5',
-  anthropicModel: 'claude-sonnet-4-6',
-  judge: 'claude',
+  modelA: 'gemini-2.5-flash',
+  modelB: 'gemini-2.5-pro',
+  judge: 'gemini-2.5-flash',
 };
 
-const PHASES = ['draft', 'critique', 'verdict'];
-const PHASE_LABEL = {
-  draft: 'Drafting',
-  critique: 'Critiquing',
-  verdict: 'Reaching verdict',
-};
+const PHASE_LABEL = { draft: 'Drafting', critique: 'Critiquing', verdict: 'Deciding' };
+
+function triggerDownload(blob, name) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = name;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+function readFile(file) {
+  const texty =
+    /^text\//.test(file.type) ||
+    /(json|javascript|xml|csv|markdown|x-sh|x-python)/.test(file.type) ||
+    file.type === '' ||
+    /\.(txt|md|js|jsx|ts|tsx|py|json|csv|html|css|scss|c|h|cpp|java|go|rs|rb|php|sh|yml|yaml|toml|sql|env|gitignore)$/i.test(file.name);
+  return new Promise((resolve) => {
+    const reader = new FileReader();
+    if (texty) {
+      reader.onload = () =>
+        resolve({ name: file.name, mimeType: file.type || 'text/plain', kind: 'text', content: reader.result });
+      reader.readAsText(file);
+    } else {
+      reader.onload = () =>
+        resolve({
+          name: file.name,
+          mimeType: file.type || 'application/octet-stream',
+          kind: 'binary',
+          content: String(reader.result).split(',')[1] || '',
+        });
+      reader.readAsDataURL(file);
+    }
+  });
+}
 
 export default function Page() {
-  const [openaiKey, setOpenaiKey] = useState('');
-  const [anthropicKey, setAnthropicKey] = useState('');
-  const [openaiModel, setOpenaiModel] = useState(DEFAULTS.openaiModel);
-  const [anthropicModel, setAnthropicModel] = useState(DEFAULTS.anthropicModel);
+  const [apiKey, setApiKey] = useState('');
+  const [modelA, setModelA] = useState(DEFAULTS.modelA);
+  const [modelB, setModelB] = useState(DEFAULTS.modelB);
   const [judge, setJudge] = useState(DEFAULTS.judge);
-
-  const [prompt, setPrompt] = useState('');
-  const [phase, setPhase] = useState('');
-  const [running, setRunning] = useState(false);
-  const [error, setError] = useState('');
   const [showSettings, setShowSettings] = useState(false);
 
-  const [res, setRes] = useState({
-    gptDraft: '',
-    claudeDraft: '',
-    gptCrit: '',
-    claudeCrit: '',
-    verdict: '',
-    verdictBy: '',
-  });
+  const [messages, setMessages] = useState([]);
+  const [input, setInput] = useState('');
+  const [pending, setPending] = useState([]); // pending attachments
+  const [running, setRunning] = useState(false);
 
-  // load saved keys/models
+  const scroller = useRef(null);
+  const fileInput = useRef(null);
+
   useEffect(() => {
     try {
       const s = JSON.parse(localStorage.getItem('tribunal') || '{}');
-      if (s.openaiKey) setOpenaiKey(s.openaiKey);
-      if (s.anthropicKey) setAnthropicKey(s.anthropicKey);
-      if (s.openaiModel) setOpenaiModel(s.openaiModel);
-      if (s.anthropicModel) setAnthropicModel(s.anthropicModel);
+      if (s.apiKey) setApiKey(s.apiKey);
+      if (s.modelA) setModelA(s.modelA);
+      if (s.modelB) setModelB(s.modelB);
       if (s.judge) setJudge(s.judge);
-      if (!s.openaiKey || !s.anthropicKey) setShowSettings(true);
+      if (!s.apiKey) setShowSettings(true);
     } catch {
       setShowSettings(true);
     }
   }, []);
 
   useEffect(() => {
-    localStorage.setItem(
-      'tribunal',
-      JSON.stringify({ openaiKey, anthropicKey, openaiModel, anthropicModel, judge })
-    );
-  }, [openaiKey, anthropicKey, openaiModel, anthropicModel, judge]);
+    localStorage.setItem('tribunal', JSON.stringify({ apiKey, modelA, modelB, judge }));
+  }, [apiKey, modelA, modelB, judge]);
 
-  function handleEvent(ev) {
-    if (ev.type === 'phase') setPhase(ev.phase);
-    else if (ev.type === 'draft')
-      setRes((r) => ({ ...r, [ev.side === 'gpt' ? 'gptDraft' : 'claudeDraft']: ev.text }));
-    else if (ev.type === 'critique')
-      setRes((r) => ({ ...r, [ev.side === 'gpt' ? 'gptCrit' : 'claudeCrit']: ev.text }));
-    else if (ev.type === 'verdict')
-      setRes((r) => ({ ...r, verdict: ev.text, verdictBy: ev.by }));
-    else if (ev.type === 'error') setError(ev.message);
+  useEffect(() => {
+    if (scroller.current) scroller.current.scrollTop = scroller.current.scrollHeight;
+  }, [messages]);
+
+  function patchAssistant(patch) {
+    setMessages((prev) => {
+      const n = [...prev];
+      for (let i = n.length - 1; i >= 0; i--)
+        if (n[i].role === 'assistant') {
+          n[i] = typeof patch === 'function' ? patch(n[i]) : { ...n[i], ...patch };
+          break;
+        }
+      return n;
+    });
   }
 
-  async function run() {
-    if (!prompt.trim()) return;
-    if (!openaiKey || !anthropicKey) {
+  function handleEvent(ev) {
+    if (ev.type === 'phase') patchAssistant({ phase: ev.phase });
+    else if (ev.type === 'draft')
+      patchAssistant((m) => ({ ...m, delib: { ...m.delib, ['draft' + ev.side]: ev.text } }));
+    else if (ev.type === 'critique')
+      patchAssistant((m) => ({ ...m, delib: { ...m.delib, ['crit' + ev.side]: ev.text } }));
+    else if (ev.type === 'verdict') patchAssistant({ content: ev.text });
+    else if (ev.type === 'files') patchAssistant({ files: ev.files });
+    else if (ev.type === 'error') patchAssistant({ error: ev.message, running: false, phase: '' });
+  }
+
+  async function onPick(e) {
+    const files = Array.from(e.target.files || []);
+    const read = await Promise.all(files.map(readFile));
+    setPending((p) => [...p, ...read]);
+    e.target.value = '';
+  }
+
+  async function send() {
+    const text = input.trim();
+    if ((!text && pending.length === 0) || running) return;
+    if (!apiKey) {
       setShowSettings(true);
-      setError('Add both API keys first.');
       return;
     }
-    setError('');
-    setPhase('draft');
+
+    const attachments = pending;
+    const userMsg = { role: 'user', content: text, files: attachments.map((a) => ({ path: a.name })) };
+    const apiMessages = [
+      ...messages.filter((m) => !m.error).map((m) => ({ role: m.role, content: m.content || '' })),
+      { role: 'user', content: text },
+    ];
+
+    setMessages((prev) => [
+      ...prev,
+      userMsg,
+      { role: 'assistant', content: '', files: [], delib: {}, phase: 'draft', running: true },
+    ]);
+    setInput('');
+    setPending([]);
     setRunning(true);
-    setRes({ gptDraft: '', claudeDraft: '', gptCrit: '', claudeCrit: '', verdict: '', verdictBy: '' });
 
     try {
-      const r = await fetch('/api/debate', {
+      const r = await fetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ prompt, openaiKey, anthropicKey, openaiModel, anthropicModel, judge }),
+        body: JSON.stringify({ apiKey, modelA, modelB, judge, messages: apiMessages, attachments }),
       });
       if (!r.body) throw new Error('No response stream (' + r.status + ')');
       const reader = r.body.getReader();
@@ -104,135 +159,199 @@ export default function Page() {
         }
       }
     } catch (e) {
-      setError(String(e?.message || e));
+      patchAssistant({ error: String(e?.message || e) });
     } finally {
+      patchAssistant({ running: false, phase: '' });
       setRunning(false);
-      setPhase('');
     }
   }
 
-  const phaseIdx = PHASES.indexOf(phase);
+  async function downloadZip(files) {
+    const zip = new JSZip();
+    files.forEach((f) => zip.file(f.path, f.content));
+    const blob = await zip.generateAsync({ type: 'blob' });
+    triggerDownload(blob, 'tribunal-files.zip');
+  }
 
   return (
-    <main>
+    <div className="app">
       <header>
-        <h1>
+        <div className="brand">
           <span className="mark">⚖</span> Tribunal
-        </h1>
-        <p className="sub">Two AIs argue. One verdict.</p>
+          <span className="tag">two AIs deliberate · one answer</span>
+        </div>
         <button className="link" onClick={() => setShowSettings((s) => !s)}>
-          {showSettings ? 'Hide keys' : 'Keys & models'}
+          {showSettings ? 'Hide' : 'Settings'}
         </button>
       </header>
 
       {showSettings && (
         <section className="settings">
           <label>
-            OpenAI key
+            Gemini API key
             <input
               type="password"
-              value={openaiKey}
-              onChange={(e) => setOpenaiKey(e.target.value)}
-              placeholder="sk-proj-..."
-              autoComplete="off"
-            />
-          </label>
-          <label>
-            Anthropic key
-            <input
-              type="password"
-              value={anthropicKey}
-              onChange={(e) => setAnthropicKey(e.target.value)}
-              placeholder="sk-ant-..."
+              value={apiKey}
+              onChange={(e) => setApiKey(e.target.value)}
+              placeholder="AIza..."
               autoComplete="off"
             />
           </label>
           <div className="row">
             <label>
-              GPT model
-              <input value={openaiModel} onChange={(e) => setOpenaiModel(e.target.value)} />
+              Model A
+              <input value={modelA} onChange={(e) => setModelA(e.target.value)} />
             </label>
             <label>
-              Claude model
-              <input value={anthropicModel} onChange={(e) => setAnthropicModel(e.target.value)} />
+              Model B
+              <input value={modelB} onChange={(e) => setModelB(e.target.value)} />
             </label>
             <label>
               Judge
-              <select value={judge} onChange={(e) => setJudge(e.target.value)}>
-                <option value="claude">Claude</option>
-                <option value="gpt">GPT</option>
-              </select>
+              <input value={judge} onChange={(e) => setJudge(e.target.value)} />
             </label>
           </div>
-          <p className="hint">Keys stay in your browser (localStorage) and are sent only to run a debate. If a model name errors, swap it.</p>
+          <p className="hint">
+            Key stays in your browser and is sent only to run a turn. Two models draft, critique each other, then the
+            judge merges the best answer. Swap any model name if one errors (free-tier picks: gemini-2.5-flash,
+            gemini-2.5-pro, gemini-3-flash-preview).
+          </p>
         </section>
       )}
 
-      <section className="composer">
-        <textarea
-          value={prompt}
-          onChange={(e) => setPrompt(e.target.value)}
-          placeholder="Ask anything. Both models answer, critique each other, then a verdict is reached."
-          rows={4}
-          onKeyDown={(e) => {
-            if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') run();
-          }}
-        />
-        <button className="run" onClick={run} disabled={running}>
-          {running ? PHASE_LABEL[phase] || 'Working…' : 'Convene ⌘↵'}
-        </button>
-      </section>
-
-      {error && <div className="error">{error}</div>}
-
-      {(running || res.gptDraft || res.verdict) && (
-        <div className="steps">
-          {PHASES.map((p, i) => (
-            <div
-              key={p}
-              className={'step' + (phaseIdx === i ? ' active' : '') + (phaseIdx > i || res.verdict ? ' done' : '')}
-            >
-              {PHASE_LABEL[p]}
+      <div className="messages" ref={scroller}>
+        {messages.length === 0 && (
+          <div className="empty">
+            <p>Ask anything, or attach files.</p>
+            <p className="dim">Two Gemini models answer, review each other, and return the best result — including downloadable code files.</p>
+          </div>
+        )}
+        {messages.map((m, i) =>
+          m.role === 'user' ? (
+            <div key={i} className="msg user">
+              <div className="bubble">
+                {m.content}
+                {m.files?.length > 0 && (
+                  <div className="chips">
+                    {m.files.map((f, j) => (
+                      <span key={j} className="chip">📎 {f.path}</span>
+                    ))}
+                  </div>
+                )}
+              </div>
             </div>
-          ))}
+          ) : (
+            <div key={i} className="msg bot">
+              <div className="bubble">
+                {m.running && <Phase phase={m.phase} />}
+
+                {(m.delib?.draftA || m.delib?.draftB) && (
+                  <details className="delib">
+                    <summary>Deliberation</summary>
+                    <div className="delib-grid">
+                      <Panel label="Model A · draft" text={m.delib.draftA} />
+                      <Panel label="Model B · draft" text={m.delib.draftB} />
+                      <Panel label="A reviews B" text={m.delib.critA} />
+                      <Panel label="B reviews A" text={m.delib.critB} />
+                    </div>
+                  </details>
+                )}
+
+                {m.content && <div className="prose">{m.content}</div>}
+
+                {m.files?.length > 0 && (
+                  <div className="files">
+                    <div className="files-head">
+                      <span>{m.files.length} file{m.files.length > 1 ? 's' : ''}</span>
+                      <button className="mini" onClick={() => downloadZip(m.files)}>Download all .zip</button>
+                    </div>
+                    {m.files.map((f, j) => (
+                      <FileCard key={j} file={f} />
+                    ))}
+                  </div>
+                )}
+
+                {m.error && <div className="error">{m.error}</div>}
+              </div>
+            </div>
+          )
+        )}
+      </div>
+
+      <div className="composer">
+        {pending.length > 0 && (
+          <div className="chips top">
+            {pending.map((a, i) => (
+              <span key={i} className="chip">
+                📎 {a.name}
+                <button onClick={() => setPending((p) => p.filter((_, k) => k !== i))}>×</button>
+              </span>
+            ))}
+          </div>
+        )}
+        <div className="composer-row">
+          <button className="attach" onClick={() => fileInput.current?.click()} title="Attach files">＋</button>
+          <input ref={fileInput} type="file" multiple hidden onChange={onPick} />
+          <textarea
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            placeholder="Message Tribunal…"
+            rows={1}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                send();
+              }
+            }}
+          />
+          <button className="send" onClick={send} disabled={running}>
+            {running ? '…' : '↑'}
+          </button>
         </div>
-      )}
-
-      {(res.gptDraft || res.claudeDraft) && (
-        <section>
-          <h2>Drafts</h2>
-          <div className="cols">
-            <Card label="GPT" tone="gpt" text={res.gptDraft} />
-            <Card label="Claude" tone="claude" text={res.claudeDraft} />
-          </div>
-        </section>
-      )}
-
-      {(res.gptCrit || res.claudeCrit) && (
-        <section>
-          <h2>Critiques</h2>
-          <div className="cols">
-            <Card label="GPT on Claude" tone="gpt" text={res.gptCrit} />
-            <Card label="Claude on GPT" tone="claude" text={res.claudeCrit} />
-          </div>
-        </section>
-      )}
-
-      {res.verdict && (
-        <section>
-          <h2>Verdict <span className="by">decided by {res.verdictBy === 'gpt' ? 'GPT' : 'Claude'}</span></h2>
-          <div className="verdict">{res.verdict}</div>
-        </section>
-      )}
-    </main>
+      </div>
+    </div>
   );
 }
 
-function Card({ label, tone, text }) {
+function Phase({ phase }) {
+  const steps = ['draft', 'critique', 'verdict'];
+  const idx = steps.indexOf(phase);
   return (
-    <div className={'card ' + tone}>
-      <div className="card-label">{label}</div>
-      <div className="card-body">{text || <span className="ph">…</span>}</div>
+    <div className="phase">
+      <span className="spinner" />
+      {steps.map((s, i) => (
+        <span key={s} className={'pstep' + (i === idx ? ' on' : '') + (idx > i ? ' done' : '')}>
+          {PHASE_LABEL[s]}
+        </span>
+      ))}
+    </div>
+  );
+}
+
+function Panel({ label, text }) {
+  return (
+    <div className="panel">
+      <div className="panel-label">{label}</div>
+      <div className="panel-body">{text || <span className="dim">…</span>}</div>
+    </div>
+  );
+}
+
+function FileCard({ file }) {
+  const [open, setOpen] = useState(false);
+  function dl() {
+    const blob = new Blob([file.content], { type: 'text/plain' });
+    triggerDownload(blob, file.path.split('/').pop());
+  }
+  return (
+    <div className="file">
+      <div className="file-head">
+        <button className="file-name" onClick={() => setOpen((o) => !o)}>
+          <span className="caret">{open ? '▾' : '▸'}</span> {file.path}
+        </button>
+        <button className="mini" onClick={dl}>Download</button>
+      </div>
+      {open && <pre className="code">{file.content}</pre>}
     </div>
   );
 }
