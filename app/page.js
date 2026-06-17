@@ -3,10 +3,17 @@
 import { useState, useEffect, useRef } from 'react';
 import JSZip from 'jszip';
 
-const DEFAULTS = {
-  modelA: 'gemini-2.5-flash',
-  modelB: 'gemini-2.5-pro',
-  judge: 'gemini-2.5-flash',
+const PROVIDERS = [
+  { id: 'gemini', label: 'Gemini', default: 'gemini-2.5-flash' },
+  { id: 'openai', label: 'OpenAI (GPT)', default: 'gpt-5.5' },
+  { id: 'anthropic', label: 'Anthropic (Claude)', default: 'claude-sonnet-4-6' },
+];
+const DEFAULT_MODEL = Object.fromEntries(PROVIDERS.map((p) => [p.id, p.default]));
+
+const DEFAULT_SLOTS = {
+  A: { provider: 'gemini', model: 'gemini-2.5-flash' },
+  B: { provider: 'openai', model: 'gpt-5.5' },
+  judge: { provider: 'gemini', model: 'gemini-2.5-flash' },
 };
 
 const PHASE_LABEL = { draft: 'Drafting', critique: 'Critiquing', verdict: 'Deciding' };
@@ -31,32 +38,24 @@ function readFile(file) {
   return new Promise((resolve) => {
     const reader = new FileReader();
     if (texty) {
-      reader.onload = () =>
-        resolve({ name: file.name, mimeType: file.type || 'text/plain', kind: 'text', content: reader.result });
+      reader.onload = () => resolve({ name: file.name, mimeType: file.type || 'text/plain', kind: 'text', content: reader.result });
       reader.readAsText(file);
     } else {
-      reader.onload = () =>
-        resolve({
-          name: file.name,
-          mimeType: file.type || 'application/octet-stream',
-          kind: 'binary',
-          content: String(reader.result).split(',')[1] || '',
-        });
+      reader.onload = () => resolve({ name: file.name, mimeType: file.type || 'application/octet-stream', kind: 'binary', content: String(reader.result).split(',')[1] || '' });
       reader.readAsDataURL(file);
     }
   });
 }
 
 export default function Page() {
-  const [apiKey, setApiKey] = useState('');
-  const [modelA, setModelA] = useState(DEFAULTS.modelA);
-  const [modelB, setModelB] = useState(DEFAULTS.modelB);
-  const [judge, setJudge] = useState(DEFAULTS.judge);
+  const [keys, setKeys] = useState({ gemini: '', openai: '', anthropic: '' });
+  const [slots, setSlots] = useState(DEFAULT_SLOTS);
   const [showSettings, setShowSettings] = useState(false);
+  const [cfgError, setCfgError] = useState('');
 
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState('');
-  const [pending, setPending] = useState([]); // pending attachments
+  const [pending, setPending] = useState([]);
   const [running, setRunning] = useState(false);
 
   const scroller = useRef(null);
@@ -65,23 +64,28 @@ export default function Page() {
   useEffect(() => {
     try {
       const s = JSON.parse(localStorage.getItem('tribunal') || '{}');
-      if (s.apiKey) setApiKey(s.apiKey);
-      if (s.modelA) setModelA(s.modelA);
-      if (s.modelB) setModelB(s.modelB);
-      if (s.judge) setJudge(s.judge);
-      if (!s.apiKey) setShowSettings(true);
+      if (s.keys) setKeys((k) => ({ ...k, ...s.keys }));
+      if (s.slots) setSlots((sl) => ({ ...sl, ...s.slots }));
+      if (!s.keys?.gemini && !s.keys?.openai && !s.keys?.anthropic) setShowSettings(true);
     } catch {
       setShowSettings(true);
     }
   }, []);
 
   useEffect(() => {
-    localStorage.setItem('tribunal', JSON.stringify({ apiKey, modelA, modelB, judge }));
-  }, [apiKey, modelA, modelB, judge]);
+    localStorage.setItem('tribunal', JSON.stringify({ keys, slots }));
+  }, [keys, slots]);
 
   useEffect(() => {
     if (scroller.current) scroller.current.scrollTop = scroller.current.scrollHeight;
   }, [messages]);
+
+  function setSlot(name, patch) {
+    setSlots((s) => ({ ...s, [name]: { ...s[name], ...patch } }));
+  }
+  function setProvider(name, provider) {
+    setSlot(name, { provider, model: DEFAULT_MODEL[provider] });
+  }
 
   function patchAssistant(patch) {
     setMessages((prev) => {
@@ -97,10 +101,8 @@ export default function Page() {
 
   function handleEvent(ev) {
     if (ev.type === 'phase') patchAssistant({ phase: ev.phase });
-    else if (ev.type === 'draft')
-      patchAssistant((m) => ({ ...m, delib: { ...m.delib, ['draft' + ev.side]: ev.text } }));
-    else if (ev.type === 'critique')
-      patchAssistant((m) => ({ ...m, delib: { ...m.delib, ['crit' + ev.side]: ev.text } }));
+    else if (ev.type === 'draft') patchAssistant((m) => ({ ...m, delib: { ...m.delib, ['draft' + ev.side]: ev.text } }));
+    else if (ev.type === 'critique') patchAssistant((m) => ({ ...m, delib: { ...m.delib, ['crit' + ev.side]: ev.text } }));
     else if (ev.type === 'verdict') patchAssistant({ content: ev.text });
     else if (ev.type === 'files') patchAssistant({ files: ev.files });
     else if (ev.type === 'error') patchAssistant({ error: ev.message, running: false, phase: '' });
@@ -113,13 +115,22 @@ export default function Page() {
     e.target.value = '';
   }
 
+  function missingKeys() {
+    const used = new Set([slots.A.provider, slots.B.provider, slots.judge.provider]);
+    return [...used].filter((p) => !keys[p]);
+  }
+
   async function send() {
     const text = input.trim();
     if ((!text && pending.length === 0) || running) return;
-    if (!apiKey) {
+
+    const miss = missingKeys();
+    if (miss.length) {
       setShowSettings(true);
+      setCfgError('Add API key(s) for: ' + miss.join(', '));
       return;
     }
+    setCfgError('');
 
     const attachments = pending;
     const userMsg = { role: 'user', content: text, files: attachments.map((a) => ({ path: a.name })) };
@@ -128,11 +139,7 @@ export default function Page() {
       { role: 'user', content: text },
     ];
 
-    setMessages((prev) => [
-      ...prev,
-      userMsg,
-      { role: 'assistant', content: '', files: [], delib: {}, phase: 'draft', running: true },
-    ]);
+    setMessages((prev) => [...prev, userMsg, { role: 'assistant', content: '', files: [], delib: {}, phase: 'draft', running: true }]);
     setInput('');
     setPending([]);
     setRunning(true);
@@ -141,7 +148,7 @@ export default function Page() {
       const r = await fetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ apiKey, modelA, modelB, judge, messages: apiMessages, attachments }),
+        body: JSON.stringify({ keys, slots, messages: apiMessages, attachments }),
       });
       if (!r.body) throw new Error('No response stream (' + r.status + ')');
       const reader = r.body.getReader();
@@ -180,42 +187,23 @@ export default function Page() {
           <span className="mark">⚖</span> Tribunal
           <span className="tag">two AIs deliberate · one answer</span>
         </div>
-        <button className="link" onClick={() => setShowSettings((s) => !s)}>
-          {showSettings ? 'Hide' : 'Settings'}
-        </button>
+        <button className="link" onClick={() => setShowSettings((s) => !s)}>{showSettings ? 'Hide' : 'Settings'}</button>
       </header>
 
       {showSettings && (
         <section className="settings">
-          <label>
-            Gemini API key
-            <input
-              type="password"
-              value={apiKey}
-              onChange={(e) => setApiKey(e.target.value)}
-              placeholder="AIza..."
-              autoComplete="off"
-            />
-          </label>
-          <div className="row">
-            <label>
-              Model A
-              <input value={modelA} onChange={(e) => setModelA(e.target.value)} />
-            </label>
-            <label>
-              Model B
-              <input value={modelB} onChange={(e) => setModelB(e.target.value)} />
-            </label>
-            <label>
-              Judge
-              <input value={judge} onChange={(e) => setJudge(e.target.value)} />
-            </label>
+          <div className="keys">
+            <label>Gemini key<input type="password" value={keys.gemini} onChange={(e) => setKeys((k) => ({ ...k, gemini: e.target.value }))} placeholder="AIza..." autoComplete="off" /></label>
+            <label>OpenAI key<input type="password" value={keys.openai} onChange={(e) => setKeys((k) => ({ ...k, openai: e.target.value }))} placeholder="sk-proj-..." autoComplete="off" /></label>
+            <label>Anthropic key<input type="password" value={keys.anthropic} onChange={(e) => setKeys((k) => ({ ...k, anthropic: e.target.value }))} placeholder="sk-ant-..." autoComplete="off" /></label>
           </div>
-          <p className="hint">
-            Key stays in your browser and is sent only to run a turn. Two models draft, critique each other, then the
-            judge merges the best answer. Swap any model name if one errors (free-tier picks: gemini-2.5-flash,
-            gemini-2.5-pro, gemini-3-flash-preview).
-          </p>
+          <div className="slots">
+            <SlotRow name="Model A" slot={slots.A} onProvider={(p) => setProvider('A', p)} onModel={(v) => setSlot('A', { model: v })} />
+            <SlotRow name="Model B" slot={slots.B} onProvider={(p) => setProvider('B', p)} onModel={(v) => setSlot('B', { model: v })} />
+            <SlotRow name="Judge" slot={slots.judge} onProvider={(p) => setProvider('judge', p)} onModel={(v) => setSlot('judge', { model: v })} />
+          </div>
+          {cfgError && <div className="error">{cfgError}</div>}
+          <p className="hint">Only fill the keys for providers you use. Keys stay in your browser and are sent only to run a turn. Tip: keep Judge on Gemini (free) to limit paid usage.</p>
         </section>
       )}
 
@@ -223,7 +211,7 @@ export default function Page() {
         {messages.length === 0 && (
           <div className="empty">
             <p>Ask anything, or attach files.</p>
-            <p className="dim">Two Gemini models answer, review each other, and return the best result — including downloadable code files.</p>
+            <p className="dim">Two models answer, review each other, and return the best result — including downloadable code files.</p>
           </div>
         )}
         {messages.map((m, i) =>
@@ -232,11 +220,7 @@ export default function Page() {
               <div className="bubble">
                 {m.content}
                 {m.files?.length > 0 && (
-                  <div className="chips">
-                    {m.files.map((f, j) => (
-                      <span key={j} className="chip">📎 {f.path}</span>
-                    ))}
-                  </div>
+                  <div className="chips">{m.files.map((f, j) => (<span key={j} className="chip">📎 {f.path}</span>))}</div>
                 )}
               </div>
             </div>
@@ -244,7 +228,6 @@ export default function Page() {
             <div key={i} className="msg bot">
               <div className="bubble">
                 {m.running && <Phase phase={m.phase} />}
-
                 {(m.delib?.draftA || m.delib?.draftB) && (
                   <details className="delib">
                     <summary>Deliberation</summary>
@@ -256,21 +239,16 @@ export default function Page() {
                     </div>
                   </details>
                 )}
-
                 {m.content && <div className="prose">{m.content}</div>}
-
                 {m.files?.length > 0 && (
                   <div className="files">
                     <div className="files-head">
                       <span>{m.files.length} file{m.files.length > 1 ? 's' : ''}</span>
                       <button className="mini" onClick={() => downloadZip(m.files)}>Download all .zip</button>
                     </div>
-                    {m.files.map((f, j) => (
-                      <FileCard key={j} file={f} />
-                    ))}
+                    {m.files.map((f, j) => (<FileCard key={j} file={f} />))}
                   </div>
                 )}
-
                 {m.error && <div className="error">{m.error}</div>}
               </div>
             </div>
@@ -282,10 +260,7 @@ export default function Page() {
         {pending.length > 0 && (
           <div className="chips top">
             {pending.map((a, i) => (
-              <span key={i} className="chip">
-                📎 {a.name}
-                <button onClick={() => setPending((p) => p.filter((_, k) => k !== i))}>×</button>
-              </span>
+              <span key={i} className="chip">📎 {a.name}<button onClick={() => setPending((p) => p.filter((_, k) => k !== i))}>×</button></span>
             ))}
           </div>
         )}
@@ -297,18 +272,23 @@ export default function Page() {
             onChange={(e) => setInput(e.target.value)}
             placeholder="Message Tribunal…"
             rows={1}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter' && !e.shiftKey) {
-                e.preventDefault();
-                send();
-              }
-            }}
+            onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); } }}
           />
-          <button className="send" onClick={send} disabled={running}>
-            {running ? '…' : '↑'}
-          </button>
+          <button className="send" onClick={send} disabled={running}>{running ? '…' : '↑'}</button>
         </div>
       </div>
+    </div>
+  );
+}
+
+function SlotRow({ name, slot, onProvider, onModel }) {
+  return (
+    <div className="slot">
+      <span className="slot-name">{name}</span>
+      <select value={slot.provider} onChange={(e) => onProvider(e.target.value)}>
+        {PROVIDERS.map((p) => (<option key={p.id} value={p.id}>{p.label}</option>))}
+      </select>
+      <input value={slot.model} onChange={(e) => onModel(e.target.value)} />
     </div>
   );
 }
@@ -319,11 +299,7 @@ function Phase({ phase }) {
   return (
     <div className="phase">
       <span className="spinner" />
-      {steps.map((s, i) => (
-        <span key={s} className={'pstep' + (i === idx ? ' on' : '') + (idx > i ? ' done' : '')}>
-          {PHASE_LABEL[s]}
-        </span>
-      ))}
+      {steps.map((s, i) => (<span key={s} className={'pstep' + (i === idx ? ' on' : '') + (idx > i ? ' done' : '')}>{PHASE_LABEL[s]}</span>))}
     </div>
   );
 }
@@ -346,9 +322,7 @@ function FileCard({ file }) {
   return (
     <div className="file">
       <div className="file-head">
-        <button className="file-name" onClick={() => setOpen((o) => !o)}>
-          <span className="caret">{open ? '▾' : '▸'}</span> {file.path}
-        </button>
+        <button className="file-name" onClick={() => setOpen((o) => !o)}><span className="caret">{open ? '▾' : '▸'}</span> {file.path}</button>
         <button className="mini" onClick={dl}>Download</button>
       </div>
       {open && <pre className="code">{file.content}</pre>}
