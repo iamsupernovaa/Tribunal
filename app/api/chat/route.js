@@ -2,6 +2,8 @@ export const runtime = 'nodejs';
 export const maxDuration = 60;
 
 const GEMINI_BASE = 'https://generativelanguage.googleapis.com/v1beta/models';
+const OPENAI_BASE = 'https://api.openai.com/v1';
+const NVIDIA_BASE = 'https://integrate.api.nvidia.com/v1';
 
 /* ---------- provider calls ---------- */
 
@@ -27,23 +29,25 @@ async function callGemini(key, model, systemText, neutral, maxTokens) {
   return text;
 }
 
-async function callOpenAI(key, model, systemText, neutral) {
+// OpenAI-compatible (OpenAI + NVIDIA NIM). allowImages=false downgrades images to text notes.
+async function callOpenAICompatible(baseURL, providerName, key, model, systemText, neutral, allowImages) {
   const messages = [];
   if (systemText) messages.push({ role: 'system', content: systemText });
   for (const m of neutral) {
     const role = m.role === 'model' ? 'assistant' : m.role;
-    if (role === 'user') messages.push({ role, content: m.parts.map(openaiPart) });
+    if (role === 'user') messages.push({ role, content: m.parts.map((p) => openaiPart(p, allowImages)) });
     else messages.push({ role, content: m.parts.map((p) => p.text || '').join('') });
   }
-  const r = await fetch('https://api.openai.com/v1/chat/completions', {
+  const r = await fetch(`${baseURL}/chat/completions`, {
     method: 'POST',
     headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
     body: JSON.stringify({ model, messages }),
   });
   const j = await r.json();
-  if (!r.ok) throw new Error(`OpenAI (${model}): ${j.error?.message || r.status}`);
-  const text = j.choices?.[0]?.message?.content ?? '';
-  if (!text) throw new Error(`OpenAI (${model}): empty response`);
+  if (!r.ok) throw new Error(`${providerName} (${model}): ${j.error?.message || j.detail || r.status}`);
+  const msg = j.choices?.[0]?.message || {};
+  const text = msg.content || msg.reasoning_content || '';
+  if (!text) throw new Error(`${providerName} (${model}): empty response`);
   return text;
 }
 
@@ -66,7 +70,8 @@ async function callAnthropic(key, model, systemText, neutral, maxTokens) {
 
 function callModel(slot, key, systemText, neutral, maxTokens) {
   if (!key) throw new Error(`Missing API key for ${slot.provider}`);
-  if (slot.provider === 'openai') return callOpenAI(key, slot.model, systemText, neutral);
+  if (slot.provider === 'openai') return callOpenAICompatible(OPENAI_BASE, 'OpenAI', key, slot.model, systemText, neutral, true);
+  if (slot.provider === 'nvidia') return callOpenAICompatible(NVIDIA_BASE, 'NVIDIA', key, slot.model, systemText, neutral, false);
   if (slot.provider === 'anthropic') return callAnthropic(key, slot.model, systemText, neutral, maxTokens);
   return callGemini(key, slot.model, systemText, neutral, maxTokens);
 }
@@ -77,8 +82,11 @@ function geminiPart(p) {
   if (p.kind === 'image' || p.kind === 'pdf') return { inline_data: { mime_type: p.mime, data: p.data } };
   return { text: p.text || '' };
 }
-function openaiPart(p) {
-  if (p.kind === 'image') return { type: 'image_url', image_url: { url: `data:${p.mime};base64,${p.data}` } };
+function openaiPart(p, allowImages) {
+  if (p.kind === 'image') {
+    if (allowImages) return { type: 'image_url', image_url: { url: `data:${p.mime};base64,${p.data}` } };
+    return { type: 'text', text: `[image "${p.name || 'image'}" attached — not supported on this model]` };
+  }
   if (p.kind === 'pdf') return { type: 'text', text: `[PDF "${p.name}" attached — not supported on this model]` };
   return { type: 'text', text: p.text || '' };
 }
@@ -94,7 +102,7 @@ function neutralAttParts(atts) {
   const parts = [];
   for (const a of atts || []) {
     const mime = a.mimeType || '';
-    if (a.kind === 'binary' && mime.startsWith('image/')) parts.push({ kind: 'image', mime, data: a.content });
+    if (a.kind === 'binary' && mime.startsWith('image/')) parts.push({ kind: 'image', mime, data: a.content, name: a.name });
     else if (a.kind === 'binary' && mime === 'application/pdf') parts.push({ kind: 'pdf', mime, data: a.content, name: a.name });
     else {
       let txt = a.content;
