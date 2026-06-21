@@ -7,13 +7,14 @@ const PROVIDERS = [
   { id: 'gemini', label: 'Gemini', default: 'gemini-2.5-flash' },
   { id: 'openai', label: 'OpenAI (GPT)', default: 'gpt-5.5' },
   { id: 'anthropic', label: 'Anthropic (Claude)', default: 'claude-sonnet-4-6' },
+  { id: 'nvidia', label: 'NVIDIA', default: 'deepseek-v4-pro' },
 ];
 const DEFAULT_MODEL = Object.fromEntries(PROVIDERS.map((p) => [p.id, p.default]));
 
 const DEFAULT_SLOTS = {
-  A: { provider: 'gemini', model: 'gemini-2.5-flash' },
-  B: { provider: 'openai', model: 'gpt-5.5' },
-  judge: { provider: 'gemini', model: 'gemini-2.5-flash' },
+  A: { provider: 'nvidia', model: 'deepseek-v4-pro' },
+  B: { provider: 'nvidia', model: 'diffusiongemma-26b-a4b-it' },
+  judge: { provider: 'nvidia', model: 'deepseek-v4-pro' },
 };
 
 const PHASE_LABEL = { draft: 'Drafting', critique: 'Critiquing', verdict: 'Deciding' };
@@ -48,7 +49,7 @@ function readFile(file) {
 }
 
 export default function Page() {
-  const [keys, setKeys] = useState({ gemini: '', openai: '', anthropic: '' });
+  const [keys, setKeys] = useState({ gemini: '', openai: '', anthropic: '', nvidia: '' });
   const [slots, setSlots] = useState(DEFAULT_SLOTS);
   const [showSettings, setShowSettings] = useState(false);
   const [cfgError, setCfgError] = useState('');
@@ -63,17 +64,17 @@ export default function Page() {
 
   useEffect(() => {
     try {
-      const s = JSON.parse(localStorage.getItem('tribunal') || '{}');
+      const s = JSON.parse(localStorage.getItem('tribunal2') || '{}');
       if (s.keys) setKeys((k) => ({ ...k, ...s.keys }));
       if (s.slots) setSlots((sl) => ({ ...sl, ...s.slots }));
-      if (!s.keys?.gemini && !s.keys?.openai && !s.keys?.anthropic) setShowSettings(true);
+      if (!s.keys?.gemini && !s.keys?.openai && !s.keys?.anthropic && !s.keys?.nvidia) setShowSettings(true);
     } catch {
       setShowSettings(true);
     }
   }, []);
 
   useEffect(() => {
-    localStorage.setItem('tribunal', JSON.stringify({ keys, slots }));
+    localStorage.setItem('tribunal2', JSON.stringify({ keys, slots }));
   }, [keys, slots]);
 
   useEffect(() => {
@@ -196,6 +197,7 @@ export default function Page() {
             <label>Gemini key<input type="password" value={keys.gemini} onChange={(e) => setKeys((k) => ({ ...k, gemini: e.target.value }))} placeholder="AIza..." autoComplete="off" /></label>
             <label>OpenAI key<input type="password" value={keys.openai} onChange={(e) => setKeys((k) => ({ ...k, openai: e.target.value }))} placeholder="sk-proj-..." autoComplete="off" /></label>
             <label>Anthropic key<input type="password" value={keys.anthropic} onChange={(e) => setKeys((k) => ({ ...k, anthropic: e.target.value }))} placeholder="sk-ant-..." autoComplete="off" /></label>
+            <label>NVIDIA key<input type="password" value={keys.nvidia} onChange={(e) => setKeys((k) => ({ ...k, nvidia: e.target.value }))} placeholder="nvapi-..." autoComplete="off" /></label>
           </div>
           <div className="slots">
             <SlotRow name="Model A" slot={slots.A} onProvider={(p) => setProvider('A', p)} onModel={(v) => setSlot('A', { model: v })} />
