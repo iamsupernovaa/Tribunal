@@ -31,6 +31,7 @@ Streams live, so you can watch each phase. The "Deliberation" panel shows both d
 - Gemini (free-tier): `gemini-2.5-flash`, `gemini-2.5-pro`, `gemini-3-flash-preview`
 - OpenAI: e.g. `gpt-5.5` (paid — needs billing on console)
 - Anthropic: e.g. `claude-sonnet-4-6` (paid — needs billing on console)
+- NVIDIA (free, build.nvidia.com): e.g. `deepseek-v4-pro`, `diffusiongemma-26b-a4b-it` — uses NVIDIA's OpenAI-compatible endpoint. Text only (image/PDF attachments are skipped for NVIDIA models).
 Swap any model string in Settings if one errors.
 
 ### Files
