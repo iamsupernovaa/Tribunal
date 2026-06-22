@@ -112,3 +112,17 @@ input:focus, textarea:focus { outline: none; border-color: var(--accent); }
   .slot { flex-wrap: wrap; }
   .slot select { width: 100%; }
 }
+
+/* settings v3: per-slot key */
+.slot { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.slot-name { flex: none; width: 64px; font-size: 13px; color: var(--muted); }
+.slot select { flex: none; width: 150px; background: var(--panel-2); border: 1px solid var(--border);
+  color: var(--text); border-radius: 9px; padding: 9px 10px; font-size: 14px; font-family: inherit; }
+.slot select:focus { outline: none; border-color: var(--accent); }
+.slot-model { flex: 1 1 160px; }
+.slot-key { flex: 1 1 160px; }
+@media (max-width: 640px) {
+  .slot { gap: 6px; }
+  .slot-name { width: 100%; }
+  .slot select, .slot-model, .slot-key { flex: 1 1 100%; width: 100%; }
+}
