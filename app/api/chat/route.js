@@ -5,13 +5,14 @@ const GEMINI_BASE = 'https://generativelanguage.googleapis.com/v1beta/models';
 const OPENAI_BASE = 'https://api.openai.com/v1';
 const NVIDIA_BASE = 'https://integrate.api.nvidia.com/v1';
 
+const MAX_ROUNDS = 3;
+const AGREE_THRESHOLD = 98;
+const TIME_BUDGET_MS = 45000;
+
 /* ---------- provider calls ---------- */
 
 async function callGemini(key, model, systemText, neutral, maxTokens) {
-  const contents = neutral.map((m) => ({
-    role: m.role === 'assistant' ? 'model' : 'user',
-    parts: m.parts.map(geminiPart),
-  }));
+  const contents = neutral.map((m) => ({ role: m.role === 'assistant' ? 'model' : 'user', parts: m.parts.map(geminiPart) }));
   const r = await fetch(`${GEMINI_BASE}/${encodeURIComponent(model)}:generateContent`, {
     method: 'POST',
     headers: { 'x-goog-api-key': key, 'Content-Type': 'application/json' },
@@ -29,7 +30,6 @@ async function callGemini(key, model, systemText, neutral, maxTokens) {
   return text;
 }
 
-// OpenAI-compatible (used by OpenAI and NVIDIA build.nvidia.com)
 async function callOpenAICompat(label, baseUrl, key, model, systemText, neutral) {
   const messages = [];
   if (systemText) messages.push({ role: 'system', content: systemText });
@@ -51,10 +51,7 @@ async function callOpenAICompat(label, baseUrl, key, model, systemText, neutral)
 }
 
 async function callAnthropic(key, model, systemText, neutral, maxTokens) {
-  const messages = neutral.map((m) => ({
-    role: m.role === 'model' ? 'assistant' : 'user',
-    content: m.parts.map(anthropicPart),
-  }));
+  const messages = neutral.map((m) => ({ role: m.role === 'model' ? 'assistant' : 'user', content: m.parts.map(anthropicPart) }));
   const r = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: { 'x-api-key': key, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
@@ -78,7 +75,9 @@ function callModel(slot, systemText, neutral, maxTokens) {
   }
 }
 
-/* ---------- neutral part -> provider part converters ---------- */
+const userMsg = (text) => [{ role: 'user', parts: [{ kind: 'text', text }] }];
+
+/* ---------- converters ---------- */
 
 function geminiPart(p) {
   if (p.kind === 'image' || p.kind === 'pdf') return { inline_data: { mime_type: p.mime, data: p.data } };
@@ -95,7 +94,7 @@ function anthropicPart(p) {
   return { type: 'text', text: p.text || '' };
 }
 
-/* ---------- attachments -> neutral parts ---------- */
+/* ---------- attachments + files ---------- */
 
 function neutralAttParts(atts) {
   const parts = [];
@@ -105,30 +104,44 @@ function neutralAttParts(atts) {
     else if (a.kind === 'binary' && mime === 'application/pdf') parts.push({ kind: 'pdf', mime, data: a.content, name: a.name });
     else {
       let txt = a.content;
-      if (a.kind === 'binary') {
-        try { txt = Buffer.from(a.content, 'base64').toString('utf-8'); } catch { txt = '[binary file omitted]'; }
-      }
+      if (a.kind === 'binary') { try { txt = Buffer.from(a.content, 'base64').toString('utf-8'); } catch { txt = '[binary file omitted]'; } }
       parts.push({ kind: 'text', text: `File: ${a.name}\n\`\`\`\n${txt}\n\`\`\`` });
     }
   }
   return parts;
 }
 
-/* ---------- file extraction ---------- */
-
 function extractFiles(text) {
   const re = /<file\s+path="([^"]+)"\s*>([\s\S]*?)<\/file>/g;
   const files = [];
   let m;
-  while ((m = re.exec(text))) {
-    files.push({ path: m[1].trim(), content: m[2].replace(/^\n/, '').replace(/\s+$/, '\n') });
-  }
+  while ((m = re.exec(text))) files.push({ path: m[1].trim(), content: m[2].replace(/^\n/, '').replace(/\s+$/, '\n') });
   const prose = text.replace(re, '').replace(/\n{3,}/g, '\n\n').trim();
   return { prose, files };
 }
 
+// Pull the @@@{...}@@@ agreement verdict out of a review.
+function parseVerdict(text) {
+  const m = text.match(/@@@\s*(\{[\s\S]*?\})\s*@@@/);
+  if (m) {
+    try {
+      const o = JSON.parse(m[1]);
+      return {
+        agreement: Math.max(0, Math.min(100, Math.round(Number(o.agreement)) || 0)),
+        corrections: o.corrections !== false,
+        clean: text.replace(/@@@[\s\S]*?@@@/, '').trim(),
+      };
+    } catch {}
+  }
+  return { agreement: 50, corrections: true, clean: text.trim() };
+}
+
 const FILE_FORMAT =
   'If your answer includes code or any files, output EACH file wrapped EXACTLY like this:\n<file path="relative/path/name.ext">\n...complete file contents...\n</file>\nGive full, runnable files with no "..." placeholders. Put any explanation as plain text outside the <file> tags.';
+
+const REVIEW_SYS =
+  "You are reviewing another engineer's answer to the user's request and comparing it against your own answer. List the concrete corrections, fixes, and additions the other answer still needs — bugs, errors, missing files, gaps. Be specific and brief. Then, on the VERY LAST line, output ONLY your agreement verdict in this exact form with nothing after it:\n" +
+  '@@@{"agreement": <integer 0-100: how fully you agree the other answer is correct and complete>, "corrections": <true if it still needs changes, false if you fully accept it as-is>}@@@';
 
 /* ---------- handler ---------- */
 
@@ -140,47 +153,56 @@ export async function POST(req) {
   const stream = new ReadableStream({
     async start(controller) {
       const emit = (o) => controller.enqueue(encoder.encode(JSON.stringify(o) + '\n'));
+      const t0 = Date.now();
       try {
         if (!A || !B || !J) throw new Error('Models not configured');
         if (!messages?.length) throw new Error('No messages');
 
-        const history = messages.map((m) => ({
-          role: m.role === 'assistant' ? 'model' : 'user',
-          parts: [{ kind: 'text', text: m.content || '' }],
-        }));
+        const history = messages.map((m) => ({ role: m.role === 'assistant' ? 'model' : 'user', parts: [{ kind: 'text', text: m.content || '' }] }));
         const att = neutralAttParts(attachments);
         const last = history[history.length - 1];
         if (last?.role === 'user' && att.length) last.parts.push(...att);
-        const latestUser = messages[messages.length - 1]?.content || '';
+        const ask = messages[messages.length - 1]?.content || '';
 
-        // Phase 1: drafts
+        // Phase 1: independent drafts
         emit({ type: 'phase', phase: 'draft' });
         const draftSys = `You are an expert engineer and writer. Answer the user's latest message as well as possible: correct, complete, well-reasoned. ${FILE_FORMAT}`;
         const aP = callModel(A, draftSys, history, 8192).then((t) => { emit({ type: 'draft', side: 'A', text: t }); return t; });
         const bP = callModel(B, draftSys, history, 8192).then((t) => { emit({ type: 'draft', side: 'B', text: t }); return t; });
-        const [draftA, draftB] = await Promise.all([aP, bP]);
+        let [ansA, ansB] = await Promise.all([aP, bP]);
 
-        // Phase 2: cross critique
-        emit({ type: 'phase', phase: 'critique' });
-        const critSys = "You are reviewing another engineer's answer (and any files) to the user's request. Find bugs, missing files, broken logic, security issues, and concrete improvements. Be specific and brief. Do not rewrite everything.";
-        const caP = callModel(A, critSys, [{ role: 'user', parts: [{ kind: 'text', text: `User request:\n${latestUser}\n\nOther engineer's answer:\n${draftB}\n\nYour critique:` }] }], 2048)
-          .then((t) => { emit({ type: 'critique', side: 'A', text: t }); return t; });
-        const cbP = callModel(B, critSys, [{ role: 'user', parts: [{ kind: 'text', text: `User request:\n${latestUser}\n\nOther engineer's answer:\n${draftA}\n\nYour critique:` }] }], 2048)
-          .then((t) => { emit({ type: 'critique', side: 'B', text: t }); return t; });
-        const [critA, critB] = await Promise.all([caP, cbP]);
+        // Phase 2: review <-> revise loop until consensus
+        let agA = 0, agB = 0, converged = false, rounds = 0;
+        const reviseSys = `Improve YOUR answer to the user's request using the reviewer's feedback. Keep what is correct, fix every valid point, and output the complete updated answer. ${FILE_FORMAT}`;
 
-        // Phase 3: verdict
+        for (let n = 1; n <= MAX_ROUNDS; n++) {
+          rounds = n;
+          emit({ type: 'phase', phase: 'review', round: n });
+          const rvA = callModel(A, REVIEW_SYS, userMsg(`User request:\n${ask}\n\nYour own answer:\n${ansA}\n\nThe other engineer's answer:\n${ansB}\n\nReview the other engineer's answer:`), 1536).then(parseVerdict);
+          const rvB = callModel(B, REVIEW_SYS, userMsg(`User request:\n${ask}\n\nYour own answer:\n${ansB}\n\nThe other engineer's answer:\n${ansA}\n\nReview the other engineer's answer:`), 1536).then(parseVerdict);
+          const [pa, pb] = await Promise.all([rvA, rvB]); // pa = A reviewing B, pb = B reviewing A
+          agA = pa.agreement; agB = pb.agreement;
+          converged = agA >= AGREE_THRESHOLD && agB >= AGREE_THRESHOLD && !pa.corrections && !pb.corrections;
+          emit({ type: 'round', n, agreementA: agA, agreementB: agB, reviewA: pa.clean, reviewB: pb.clean, converged });
+
+          if (converged) break;
+          if (n === MAX_ROUNDS || Date.now() - t0 > TIME_BUDGET_MS) break;
+
+          emit({ type: 'phase', phase: 'revise', round: n });
+          const reA = callModel(A, reviseSys, userMsg(`User request:\n${ask}\n\nYour current answer:\n${ansA}\n\nReviewer feedback on your answer:\n${pb.clean}\n\nYour improved answer:`), 8192);
+          const reB = callModel(B, reviseSys, userMsg(`User request:\n${ask}\n\nYour current answer:\n${ansB}\n\nReviewer feedback on your answer:\n${pa.clean}\n\nYour improved answer:`), 8192);
+          [ansA, ansB] = await Promise.all([reA, reB]);
+        }
+
+        // Phase 3: merge into final deliverable
         emit({ type: 'phase', phase: 'verdict' });
-        const verdictSys = `Two engineers (A and B) answered the user's request, then critiqued each other. Produce the single best FINAL answer for the user: merge the strengths, fix every valid issue raised, and resolve disagreements on the side of correctness. ${FILE_FORMAT} This is the final deliverable.`;
-        const bundleParts = [
-          { kind: 'text', text: `User request:\n${latestUser}\n\n=== Engineer A answer ===\n${draftA}\n\n=== Engineer B answer ===\n${draftB}\n\n=== A's critique of B ===\n${critA}\n\n=== B's critique of A ===\n${critB}\n\nWrite the final answer now.` },
-          ...att,
-        ];
-        const verdict = await callModel(J, verdictSys, [{ role: 'user', parts: bundleParts }], 8192);
+        const verdictSys = `Two engineers (A and B) answered the user's request and reviewed each other to ${converged ? 'consensus' : 'near-consensus'} (agreement A ${agA}%, B ${agB}%). Merge their two answers into the single best FINAL answer for the user: keep all correct content, fix any remaining issues, resolve disagreements on the side of correctness, and remove redundancy. ${FILE_FORMAT} This is the final deliverable.`;
+        const verdict = await callModel(J, verdictSys, [{ role: 'user', parts: [{ kind: 'text', text: `User request:\n${ask}\n\n=== Engineer A final answer ===\n${ansA}\n\n=== Engineer B final answer ===\n${ansB}\n\nWrite the merged final answer now.` }, ...att] }], 8192);
 
         const { prose, files } = extractFiles(verdict);
         emit({ type: 'verdict', text: prose || '(final files below)' });
         if (files.length) emit({ type: 'files', files });
+        emit({ type: 'stats', rounds, agreementA: agA, agreementB: agB, seconds: Math.round((Date.now() - t0) / 1000), converged });
         emit({ type: 'done' });
       } catch (e) {
         emit({ type: 'error', message: String(e?.message || e) });
@@ -190,7 +212,5 @@ export async function POST(req) {
     },
   });
 
-  return new Response(stream, {
-    headers: { 'Content-Type': 'application/x-ndjson; charset=utf-8', 'Cache-Control': 'no-store' },
-  });
+  return new Response(stream, { headers: { 'Content-Type': 'application/x-ndjson; charset=utf-8', 'Cache-Control': 'no-store' } });
 }
