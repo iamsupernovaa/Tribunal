@@ -2,39 +2,52 @@
 
 Two AIs deliberate. One answer.
 
-A chat app where two models independently answer, critique each other, then a judge model merges the best result — including downloadable multi-file code. Mix providers freely: Gemini, OpenAI (GPT), and Anthropic (Claude). Attach files as input; get files back.
+A chat app where two models independently answer, review each other to consensus (agreement %, capped rounds), then a judge merges the best result — including downloadable multi-file code. Login with Google/GitHub; chats + projects sync across devices. Mix providers per chat: Gemini, OpenAI (GPT), Anthropic (Claude), NVIDIA.
+
+## Setup
+
+### 1. Database (Neon, free)
+1. Create a project at neon.tech.
+2. Copy the **pooled** connection string into `DATABASE_URL`.
+Tables are created automatically on first use.
+
+### 2. Auth secret
+`openssl rand -base64 32` -> `NEXTAUTH_SECRET`.
+
+### 3. Google OAuth
+console.cloud.google.com -> APIs & Services -> Credentials -> Create OAuth client ID (Web).
+Authorized redirect URI: `{NEXTAUTH_URL}/api/auth/callback/google`
+-> `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`.
+
+### 4. GitHub OAuth
+github.com/settings/developers -> New OAuth App.
+Authorization callback URL: `{NEXTAUTH_URL}/api/auth/callback/github`
+-> `GITHUB_ID`, `GITHUB_SECRET`.
+
+Copy `.env.example` to `.env.local` and fill everything in. (OAuth callback URLs are per-environment — add both your localhost and your Vercel URLs, or make one app per environment.)
 
 ## Run locally
 ```
 npm install
 npm run dev
 ```
-Open http://localhost:3000 → **Settings** → paste keys for the providers you use, pick a provider + model for Model A, Model B, and Judge.
+http://localhost:3000 -> sign in -> open **Settings** (model row) -> pick provider/model and paste keys per model.
 
-## Deploy
-Push to GitHub, import the repo on Vercel. No config needed.
+## Deploy (Vercel)
+Push to GitHub, import on Vercel, add all `.env` vars in Project Settings -> Environment Variables, set `NEXTAUTH_URL` to your Vercel URL. Redeploy.
 
 ## How it works
-1. Models A and B each draft an answer (and any files), in parallel.
-2. Each reviews the other's draft.
-3. The judge merges everything into the final answer + files.
+1. Models A and B each draft an answer (and files), in parallel.
+2. Each reviews the other and reports an agreement %.
+3. They revise; the loop repeats until both >=98% with no remaining corrections (max 3 rounds / 45s).
+4. The judge merges the two final answers into one deliverable + files.
+The final message shows consensus, round count, agreement %, and seconds.
 
-Streams live, so you can watch each phase. The "Deliberation" panel shows both drafts and both critiques.
-
-## Setup notes
-- Each slot (A / B / Judge) picks its own provider and model. Default: A = Gemini flash, B = GPT, Judge = Gemini flash.
-- Keep the **Judge on Gemini (free)** to limit paid API spend — only the two draft+critique calls hit the paid model.
-- Keys live in your browser (localStorage) and are sent only to run a turn. Never stored server-side.
-- All providers are called server-side via `/api/chat` (avoids browser CORS).
+## Notes
+- **API keys stay in your browser** (localStorage) and are sent per-request only. They are never written to the database. On a new device you re-enter keys (chats/projects still sync).
+- Chats, projects, titles, messages, and per-chat/per-project model choices are stored in your Neon DB, scoped to your login.
+- Provider calls run server-side (`/api/chat`) to avoid browser CORS.
+- Convergence is capped to fit Vercel's 60s function limit; large tasks stop at the cap and still merge.
 
 ### Model strings
-- Gemini (free-tier): `gemini-2.5-flash`, `gemini-2.5-pro`, `gemini-3-flash-preview`
-- OpenAI: e.g. `gpt-5.5` (paid — needs billing on console)
-- Anthropic: e.g. `claude-sonnet-4-6` (paid — needs billing on console)
-- NVIDIA (free, build.nvidia.com): e.g. `deepseek-v4-pro`, `diffusiongemma-26b-a4b-it` — uses NVIDIA's OpenAI-compatible endpoint. Text only (image/PDF attachments are skipped for NVIDIA models).
-Swap any model string in Settings if one errors.
-
-### Files
-Attach text/code (all providers), images (all), or PDFs (Gemini + Claude; GPT shows a placeholder). Generated files appear as cards — download individually or as a `.zip`.
-
-Output is capped per turn (~8K tokens), so very large multi-file projects may truncate; ask for fewer files per turn or use a higher-output model.
+Gemini (free): `gemini-2.5-flash`, `gemini-2.5-pro`, `gemini-3-flash-preview` · OpenAI: `gpt-5.5` · Anthropic: `claude-sonnet-4-6` · NVIDIA: e.g. `deepseek-ai/deepseek-r1`. Use a text (not image/diffusion) model in every slot. Swap any string in Settings if one errors.
