@@ -1,6 +1,7 @@
 'use client';
 
 import { useState, useEffect, useRef } from 'react';
+import { useSession, signIn, signOut } from 'next-auth/react';
 import JSZip from 'jszip';
 
 const PROVIDERS = [
@@ -10,7 +11,6 @@ const PROVIDERS = [
   { id: 'nvidia', label: 'NVIDIA', default: 'deepseek-ai/deepseek-r1' },
 ];
 const DEFAULT_MODEL = Object.fromEntries(PROVIDERS.map((p) => [p.id, p.default]));
-const PROVIDER_LABEL = Object.fromEntries(PROVIDERS.map((p) => [p.id, p.label]));
 
 const DEFAULT_SLOTS = {
   A: { provider: 'nvidia', model: 'deepseek-ai/deepseek-r1', key: '' },
@@ -19,19 +19,33 @@ const DEFAULT_SLOTS = {
 };
 
 const PHASE_LABEL = { draft: 'Drafting', review: 'Reviewing', revise: 'Revising', verdict: 'Merging' };
-const STORE_KEY = 'tribunal_v3';
+const KEYS_LS = 'tribunal_keys';
+const SLOT_NAMES = ['A', 'B', 'judge'];
 
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
 const clone = (o) => JSON.parse(JSON.stringify(o));
 
+/* ---- client-only keychain (keys never go to the server) ---- */
+const loadKeychain = () => { try { return JSON.parse(localStorage.getItem(KEYS_LS) || '{}'); } catch { return {}; } };
+const saveKeychain = (kc) => localStorage.setItem(KEYS_LS, JSON.stringify(kc));
+function setKey(chatId, slot, key) { const kc = loadKeychain(); kc[chatId] = { ...(kc[chatId] || {}), [slot]: key }; saveKeychain(kc); }
+function keysOf(chatId) { return loadKeychain()[chatId] || {}; }
+function overlayKeys(slots, keys) {
+  const out = {};
+  for (const n of SLOT_NAMES) out[n] = { ...(slots?.[n] || DEFAULT_SLOTS[n]), key: keys?.[n] || '' };
+  return out;
+}
+const stripKeys = (slots) => ({
+  A: { provider: slots.A.provider, model: slots.A.model },
+  B: { provider: slots.B.provider, model: slots.B.model },
+  judge: { provider: slots.judge.provider, model: slots.judge.model },
+});
+
 function triggerDownload(blob, name) {
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
-  a.href = url;
-  a.download = name;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
+  a.href = url; a.download = name;
+  document.body.appendChild(a); a.click(); a.remove();
   URL.revokeObjectURL(url);
 }
 
@@ -56,30 +70,25 @@ function readFile(file) {
 function blankChat(projectId, slots) {
   return { id: uid(), projectId: projectId || null, title: 'New chat', slots: clone(slots || DEFAULT_SLOTS), messages: [] };
 }
-
-// Strip heavy transient fields before persisting.
-function serialize(store) {
-  return {
-    projects: store.projects,
-    activeId: store.activeId,
-    chats: store.chats.map((c) => ({
-      id: c.id,
-      projectId: c.projectId,
-      title: c.title,
-      slots: c.slots,
-      messages: c.messages.map((m) =>
-        m.role === 'user'
-          ? { role: 'user', content: m.content, files: m.files }
-          : { role: 'assistant', content: m.content, files: m.files, stats: m.stats, error: m.error }
-      ),
-    })),
-  };
+function serializeMessages(msgs) {
+  return msgs.map((m) =>
+    m.role === 'user'
+      ? { role: 'user', content: m.content, files: m.files }
+      : { role: 'assistant', content: m.content, files: m.files, stats: m.stats, error: m.error }
+  );
 }
 
+/* ---- server sync helpers ---- */
+const api = (action, body) => fetch('/api/data', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action, ...body }) }).catch(() => {});
+const saveChatServer = (c) => api('upsertChat', { chat: { id: c.id, projectId: c.projectId, title: c.title, slots: stripKeys(c.slots), messages: serializeMessages(c.messages) } });
+const saveProjectServer = (p) => api('upsertProject', { project: { id: p.id, name: p.name, slots: p.slots || null } });
+
 export default function Page() {
+  const { data: session, status } = useSession();
+
   const [store, setStore] = useState({ projects: [], chats: [], activeId: null });
   const [hydrated, setHydrated] = useState(false);
-  const [editing, setEditing] = useState(null); // {type:'chat'|'project', id}
+  const [editing, setEditing] = useState(null);
   const [cfgError, setCfgError] = useState('');
   const [sidebar, setSidebar] = useState(false);
 
@@ -89,47 +98,65 @@ export default function Page() {
 
   const scroller = useRef(null);
   const fileInput = useRef(null);
+  const saveTimer = useRef(null);
 
+  // load data from server once signed in
   useEffect(() => {
-    let s;
-    try { s = JSON.parse(localStorage.getItem(STORE_KEY) || 'null'); } catch {}
-    if (s && s.chats?.length) setStore(s);
-    else { const c = blankChat(null, DEFAULT_SLOTS); setStore({ projects: [], chats: [c], activeId: c.id }); }
-    setHydrated(true);
-  }, []);
+    if (status !== 'authenticated' || hydrated) return;
+    (async () => {
+      let projects = [], chats = [];
+      try {
+        const r = await fetch('/api/data');
+        if (r.ok) { const d = await r.json(); projects = d.projects || []; chats = d.chats || []; }
+      } catch {}
+      chats = chats.map((c) => ({ ...c, slots: overlayKeys(c.slots, keysOf(c.id)), messages: c.messages || [] }));
+      if (chats.length === 0) { const c = blankChat(null, DEFAULT_SLOTS); chats = [c]; saveChatServer(c); }
+      setStore({ projects, chats, activeId: chats[0].id });
+      setHydrated(true);
+    })();
+  }, [status, hydrated]);
 
-  useEffect(() => { if (hydrated) localStorage.setItem(STORE_KEY, JSON.stringify(serialize(store))); }, [store, hydrated]);
+  // debounced save of the active chat
+  useEffect(() => {
+    if (!hydrated) return;
+    const c = store.chats.find((x) => x.id === store.activeId);
+    if (!c) return;
+    clearTimeout(saveTimer.current);
+    saveTimer.current = setTimeout(() => saveChatServer(c), 1000);
+  }, [store, hydrated]);
+
   useEffect(() => { if (scroller.current) scroller.current.scrollTop = scroller.current.scrollHeight; }, [store]);
 
   const activeChat = store.chats.find((c) => c.id === store.activeId) || null;
-
-  /* ---- store ops ---- */
   const updateChat = (id, fn) => setStore((s) => ({ ...s, chats: s.chats.map((c) => (c.id === id ? fn(c) : c)) }));
+
   function newChat(projectId = null) {
     const proj = projectId ? store.projects.find((p) => p.id === projectId) : null;
-    const slots = (proj && proj.slots) || activeChat?.slots || DEFAULT_SLOTS;
-    const c = blankChat(projectId, slots);
+    const base = (proj && proj.slots) || activeChat?.slots || DEFAULT_SLOTS;
+    const c = blankChat(projectId, base);
+    if (proj && proj.slots) { const ak = keysOf(activeChat?.id); c.slots = overlayKeys(c.slots, ak); }
+    setKey(c.id, 'A', c.slots.A.key); setKey(c.id, 'B', c.slots.B.key); setKey(c.id, 'judge', c.slots.judge.key);
     setStore((s) => ({ ...s, chats: [c, ...s.chats], activeId: c.id }));
-    setEditing(null);
-    setSidebar(false);
+    saveChatServer(c);
+    setEditing(null); setSidebar(false);
   }
   function deleteChat(id) {
-    setStore((s) => {
-      const chats = s.chats.filter((c) => c.id !== id);
-      return { ...s, chats, activeId: s.activeId === id ? chats[0]?.id || null : s.activeId };
-    });
+    api('deleteChat', { id });
+    setStore((s) => { const chats = s.chats.filter((c) => c.id !== id); return { ...s, chats, activeId: s.activeId === id ? chats[0]?.id || null : s.activeId }; });
   }
   function selectChat(id) { setStore((s) => ({ ...s, activeId: id })); setEditing(null); setSidebar(false); }
   function newProject() {
     const name = (prompt('Project name') || '').trim();
     if (!name) return;
-    setStore((s) => ({ ...s, projects: [...s.projects, { id: uid(), name, slots: null }] }));
+    const p = { id: uid(), name, slots: null };
+    setStore((s) => ({ ...s, projects: [...s.projects, p] }));
+    saveProjectServer(p);
   }
   function deleteProject(id) {
+    api('deleteProject', { id });
     setStore((s) => ({ ...s, projects: s.projects.filter((p) => p.id !== id), chats: s.chats.map((c) => (c.projectId === id ? { ...c, projectId: null } : c)) }));
   }
 
-  /* ---- slot editing (target = chat or project) ---- */
   function targetSlots() {
     if (!editing) return null;
     if (editing.type === 'chat') return store.chats.find((c) => c.id === editing.id)?.slots || null;
@@ -137,12 +164,18 @@ export default function Page() {
   }
   function setTargetSlot(name, patch) {
     if (!editing) return;
-    if (editing.type === 'chat') updateChat(editing.id, (c) => ({ ...c, slots: { ...c.slots, [name]: { ...c.slots[name], ...patch } } }));
-    else setStore((s) => ({ ...s, projects: s.projects.map((p) => {
-      if (p.id !== editing.id) return p;
-      const base = p.slots || DEFAULT_SLOTS;
-      return { ...p, slots: { ...base, [name]: { ...base[name], ...patch } } };
-    }) }));
+    if (editing.type === 'chat') {
+      updateChat(editing.id, (c) => ({ ...c, slots: { ...c.slots, [name]: { ...c.slots[name], ...patch } } }));
+      if ('key' in patch) setKey(editing.id, name, patch.key);
+    } else {
+      setStore((s) => ({ ...s, projects: s.projects.map((p) => {
+        if (p.id !== editing.id) return p;
+        const base = p.slots || stripKeys(DEFAULT_SLOTS);
+        const np = { ...p, slots: { ...base, [name]: { ...base[name], ...patch } } };
+        saveProjectServer(np);
+        return np;
+      }) }));
+    }
   }
   const setTargetProvider = (name, provider) => setTargetSlot(name, { provider, model: DEFAULT_MODEL[provider] });
 
@@ -181,9 +214,7 @@ export default function Page() {
       title: c.title === 'New chat' ? (text.slice(0, 42) || 'New chat') : c.title,
       messages: [...c.messages, userMsg, { role: 'assistant', content: '', files: [], delib: {}, rounds: [], phase: 'draft', running: true }],
     }));
-    setInput('');
-    setPending([]);
-    setRunning(true);
+    setInput(''); setPending([]); setRunning(true);
 
     const patch = (p) => patchAsstOf(id, p);
     const handle = (ev) => {
@@ -198,6 +229,7 @@ export default function Page() {
 
     try {
       const r = await fetch('/api/chat', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ slots, messages: apiMessages, attachments }) });
+      if (r.status === 401) throw new Error('Session expired — sign in again.');
       if (!r.body) throw new Error('No response stream (' + r.status + ')');
       const reader = r.body.getReader();
       const dec = new TextDecoder();
@@ -223,6 +255,20 @@ export default function Page() {
     const blob = await zip.generateAsync({ type: 'blob' });
     triggerDownload(blob, 'tribunal-files.zip');
   }
+
+  /* ---- auth gates ---- */
+  if (status === 'loading') return <div className="auth-screen"><div className="spinner big" /></div>;
+  if (status === 'unauthenticated')
+    return (
+      <div className="auth-screen">
+        <div className="auth-card">
+          <div className="auth-brand"><span className="mark">⚖</span> Tribunal</div>
+          <p className="auth-sub">Two AIs deliberate. One answer.</p>
+          <button className="auth-btn" onClick={() => signIn('google')}>Continue with Google</button>
+          <button className="auth-btn" onClick={() => signIn('github')}>Continue with GitHub</button>
+        </div>
+      </div>
+    );
 
   const ungrouped = store.chats.filter((c) => !c.projectId);
   const ts = targetSlots();
@@ -257,6 +303,11 @@ export default function Page() {
             <ChatRow key={c.id} chat={c} active={c.id === store.activeId} onSelect={() => selectChat(c.id)} onDelete={() => deleteChat(c.id)} />
           ))}
         </div>
+
+        <div className="side-user">
+          <span className="user-email">{session?.user?.email}</span>
+          <button onClick={() => signOut()}>Sign out</button>
+        </div>
       </aside>
 
       {sidebar && <div className="scrim" onClick={() => setSidebar(false)} />}
@@ -276,12 +327,12 @@ export default function Page() {
           <section className="settings">
             <div className="edit-head">Models for {editing.type === 'project' ? 'project' : 'chat'}: <b>{editTitle}</b><button className="link" onClick={() => setEditing(null)}>Done</button></div>
             <div className="slots">
-              <SlotRow name="Model A" slot={ts.A} onProvider={(p) => setTargetProvider('A', p)} onModel={(v) => setTargetSlot('A', { model: v })} onKey={(v) => setTargetSlot('A', { key: v })} />
-              <SlotRow name="Model B" slot={ts.B} onProvider={(p) => setTargetProvider('B', p)} onModel={(v) => setTargetSlot('B', { model: v })} onKey={(v) => setTargetSlot('B', { key: v })} />
-              <SlotRow name="Judge" slot={ts.judge} onProvider={(p) => setTargetProvider('judge', p)} onModel={(v) => setTargetSlot('judge', { model: v })} onKey={(v) => setTargetSlot('judge', { key: v })} />
+              <SlotRow name="Model A" slot={ts.A} noKey={editing.type === 'project'} onProvider={(p) => setTargetProvider('A', p)} onModel={(v) => setTargetSlot('A', { model: v })} onKey={(v) => setTargetSlot('A', { key: v })} />
+              <SlotRow name="Model B" slot={ts.B} noKey={editing.type === 'project'} onProvider={(p) => setTargetProvider('B', p)} onModel={(v) => setTargetSlot('B', { model: v })} onKey={(v) => setTargetSlot('B', { key: v })} />
+              <SlotRow name="Judge" slot={ts.judge} noKey={editing.type === 'project'} onProvider={(p) => setTargetProvider('judge', p)} onModel={(v) => setTargetSlot('judge', { model: v })} onKey={(v) => setTargetSlot('judge', { key: v })} />
             </div>
             {cfgError && <div className="error">{cfgError}</div>}
-            <p className="hint">{editing.type === 'project' ? 'New chats created in this project inherit these models.' : 'These models apply to this chat only.'} Each model has its own key (so two keys on one provider work). Keys stay in your browser. Tip: keep Judge on Gemini (free).</p>
+            <p className="hint">{editing.type === 'project' ? 'New chats in this project inherit these models (keys are entered per chat and stay on your device).' : 'These models apply to this chat only. Each model has its own key; keys stay in your browser and are never stored on the server.'}</p>
           </section>
         )}
 
@@ -387,7 +438,7 @@ function ChatRow({ chat, active, onSelect, onDelete }) {
   );
 }
 
-function SlotRow({ name, slot, onProvider, onModel, onKey }) {
+function SlotRow({ name, slot, noKey, onProvider, onModel, onKey }) {
   return (
     <div className="slot">
       <span className="slot-name">{name}</span>
@@ -395,7 +446,7 @@ function SlotRow({ name, slot, onProvider, onModel, onKey }) {
         {PROVIDERS.map((p) => (<option key={p.id} value={p.id}>{p.label}</option>))}
       </select>
       <input className="slot-model" value={slot.model} onChange={(e) => onModel(e.target.value)} placeholder="model" />
-      <input className="slot-key" type="password" value={slot.key} onChange={(e) => onKey(e.target.value)} placeholder="API key" autoComplete="off" />
+      {!noKey && <input className="slot-key" type="password" value={slot.key} onChange={(e) => onKey(e.target.value)} placeholder="API key" autoComplete="off" />}
     </div>
   );
 }
