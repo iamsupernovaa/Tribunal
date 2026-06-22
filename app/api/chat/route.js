@@ -29,25 +29,24 @@ async function callGemini(key, model, systemText, neutral, maxTokens) {
   return text;
 }
 
-// OpenAI-compatible (OpenAI + NVIDIA NIM). allowImages=false downgrades images to text notes.
-async function callOpenAICompatible(baseURL, providerName, key, model, systemText, neutral, allowImages) {
+// OpenAI-compatible (used by OpenAI and NVIDIA build.nvidia.com)
+async function callOpenAICompat(label, baseUrl, key, model, systemText, neutral) {
   const messages = [];
   if (systemText) messages.push({ role: 'system', content: systemText });
   for (const m of neutral) {
     const role = m.role === 'model' ? 'assistant' : m.role;
-    if (role === 'user') messages.push({ role, content: m.parts.map((p) => openaiPart(p, allowImages)) });
+    if (role === 'user') messages.push({ role, content: m.parts.map(openaiPart) });
     else messages.push({ role, content: m.parts.map((p) => p.text || '').join('') });
   }
-  const r = await fetch(`${baseURL}/chat/completions`, {
+  const r = await fetch(`${baseUrl}/chat/completions`, {
     method: 'POST',
     headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
     body: JSON.stringify({ model, messages }),
   });
   const j = await r.json();
-  if (!r.ok) throw new Error(`${providerName} (${model}): ${j.error?.message || j.detail || r.status}`);
-  const msg = j.choices?.[0]?.message || {};
-  const text = msg.content || msg.reasoning_content || '';
-  if (!text) throw new Error(`${providerName} (${model}): empty response`);
+  if (!r.ok) throw new Error(`${label} (${model}): ${j.error?.message || j.detail || r.status}`);
+  const text = j.choices?.[0]?.message?.content ?? '';
+  if (!text) throw new Error(`${label} (${model}): empty response`);
   return text;
 }
 
@@ -68,12 +67,15 @@ async function callAnthropic(key, model, systemText, neutral, maxTokens) {
   return text;
 }
 
-function callModel(slot, key, systemText, neutral, maxTokens) {
-  if (!key) throw new Error(`Missing API key for ${slot.provider}`);
-  if (slot.provider === 'openai') return callOpenAICompatible(OPENAI_BASE, 'OpenAI', key, slot.model, systemText, neutral, true);
-  if (slot.provider === 'nvidia') return callOpenAICompatible(NVIDIA_BASE, 'NVIDIA', key, slot.model, systemText, neutral, false);
-  if (slot.provider === 'anthropic') return callAnthropic(key, slot.model, systemText, neutral, maxTokens);
-  return callGemini(key, slot.model, systemText, neutral, maxTokens);
+function callModel(slot, systemText, neutral, maxTokens) {
+  const key = slot?.key;
+  if (!key) throw new Error(`Missing API key for ${slot?.provider || 'a'} slot`);
+  switch (slot.provider) {
+    case 'openai': return callOpenAICompat('OpenAI', OPENAI_BASE, key, slot.model, systemText, neutral);
+    case 'nvidia': return callOpenAICompat('NVIDIA', NVIDIA_BASE, key, slot.model, systemText, neutral);
+    case 'anthropic': return callAnthropic(key, slot.model, systemText, neutral, maxTokens);
+    default: return callGemini(key, slot.model, systemText, neutral, maxTokens);
+  }
 }
 
 /* ---------- neutral part -> provider part converters ---------- */
@@ -82,11 +84,8 @@ function geminiPart(p) {
   if (p.kind === 'image' || p.kind === 'pdf') return { inline_data: { mime_type: p.mime, data: p.data } };
   return { text: p.text || '' };
 }
-function openaiPart(p, allowImages) {
-  if (p.kind === 'image') {
-    if (allowImages) return { type: 'image_url', image_url: { url: `data:${p.mime};base64,${p.data}` } };
-    return { type: 'text', text: `[image "${p.name || 'image'}" attached — not supported on this model]` };
-  }
+function openaiPart(p) {
+  if (p.kind === 'image') return { type: 'image_url', image_url: { url: `data:${p.mime};base64,${p.data}` } };
   if (p.kind === 'pdf') return { type: 'text', text: `[PDF "${p.name}" attached — not supported on this model]` };
   return { type: 'text', text: p.text || '' };
 }
@@ -102,7 +101,7 @@ function neutralAttParts(atts) {
   const parts = [];
   for (const a of atts || []) {
     const mime = a.mimeType || '';
-    if (a.kind === 'binary' && mime.startsWith('image/')) parts.push({ kind: 'image', mime, data: a.content, name: a.name });
+    if (a.kind === 'binary' && mime.startsWith('image/')) parts.push({ kind: 'image', mime, data: a.content });
     else if (a.kind === 'binary' && mime === 'application/pdf') parts.push({ kind: 'pdf', mime, data: a.content, name: a.name });
     else {
       let txt = a.content;
@@ -134,9 +133,8 @@ const FILE_FORMAT =
 /* ---------- handler ---------- */
 
 export async function POST(req) {
-  const { keys, slots, messages, attachments } = await req.json();
+  const { slots, messages, attachments } = await req.json();
   const A = slots?.A, B = slots?.B, J = slots?.judge;
-  const keyFor = (s) => keys?.[s.provider];
   const encoder = new TextEncoder();
 
   const stream = new ReadableStream({
@@ -158,16 +156,16 @@ export async function POST(req) {
         // Phase 1: drafts
         emit({ type: 'phase', phase: 'draft' });
         const draftSys = `You are an expert engineer and writer. Answer the user's latest message as well as possible: correct, complete, well-reasoned. ${FILE_FORMAT}`;
-        const aP = callModel(A, keyFor(A), draftSys, history, 8192).then((t) => { emit({ type: 'draft', side: 'A', text: t }); return t; });
-        const bP = callModel(B, keyFor(B), draftSys, history, 8192).then((t) => { emit({ type: 'draft', side: 'B', text: t }); return t; });
+        const aP = callModel(A, draftSys, history, 8192).then((t) => { emit({ type: 'draft', side: 'A', text: t }); return t; });
+        const bP = callModel(B, draftSys, history, 8192).then((t) => { emit({ type: 'draft', side: 'B', text: t }); return t; });
         const [draftA, draftB] = await Promise.all([aP, bP]);
 
         // Phase 2: cross critique
         emit({ type: 'phase', phase: 'critique' });
         const critSys = "You are reviewing another engineer's answer (and any files) to the user's request. Find bugs, missing files, broken logic, security issues, and concrete improvements. Be specific and brief. Do not rewrite everything.";
-        const caP = callModel(A, keyFor(A), critSys, [{ role: 'user', parts: [{ kind: 'text', text: `User request:\n${latestUser}\n\nOther engineer's answer:\n${draftB}\n\nYour critique:` }] }], 2048)
+        const caP = callModel(A, critSys, [{ role: 'user', parts: [{ kind: 'text', text: `User request:\n${latestUser}\n\nOther engineer's answer:\n${draftB}\n\nYour critique:` }] }], 2048)
           .then((t) => { emit({ type: 'critique', side: 'A', text: t }); return t; });
-        const cbP = callModel(B, keyFor(B), critSys, [{ role: 'user', parts: [{ kind: 'text', text: `User request:\n${latestUser}\n\nOther engineer's answer:\n${draftA}\n\nYour critique:` }] }], 2048)
+        const cbP = callModel(B, critSys, [{ role: 'user', parts: [{ kind: 'text', text: `User request:\n${latestUser}\n\nOther engineer's answer:\n${draftA}\n\nYour critique:` }] }], 2048)
           .then((t) => { emit({ type: 'critique', side: 'B', text: t }); return t; });
         const [critA, critB] = await Promise.all([caP, cbP]);
 
@@ -178,7 +176,7 @@ export async function POST(req) {
           { kind: 'text', text: `User request:\n${latestUser}\n\n=== Engineer A answer ===\n${draftA}\n\n=== Engineer B answer ===\n${draftB}\n\n=== A's critique of B ===\n${critA}\n\n=== B's critique of A ===\n${critB}\n\nWrite the final answer now.` },
           ...att,
         ];
-        const verdict = await callModel(J, keyFor(J), verdictSys, [{ role: 'user', parts: bundleParts }], 8192);
+        const verdict = await callModel(J, verdictSys, [{ role: 'user', parts: bundleParts }], 8192);
 
         const { prose, files } = extractFiles(verdict);
         emit({ type: 'verdict', text: prose || '(final files below)' });
